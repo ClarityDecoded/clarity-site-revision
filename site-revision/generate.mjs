@@ -35,16 +35,19 @@ const NVIDIA_KEY = process.env.NVIDIA_API_KEY;
 const NVIDIA_BASE = (process.env.NVIDIA_BASE || 'https://integrate.api.nvidia.com/v1').replace(/\/$/, '');
 const NVIDIA_MODEL = process.env.NVIDIA_LLM_MODEL || 'meta/llama-3.3-70b-instruct';
 
-// Primary model, Rahul's call (2026-08-21) — Kimi K2's free tier via
-// OpenRouter. Strong instruction-following for a narrow single-element
-// edit like this, and free-tier daily caps matter less here than in the
-// reel worker (one call per feedback item, not thousands a night). NVIDIA
-// is the fallback below, kept around specifically because of the 10-minute
-// hang this same day (see callModel) — a second provider, not just a
-// second attempt at the first one.
+// Primary model, Rahul's call (2026-08-21) — Kimi K2 via OpenRouter.
+// Strong instruction-following for a narrow single-element edit like this.
+// NOT a free-tier model — checked OpenRouter's own /models catalog and
+// there is no `:free` Kimi variant (that suffix 404s outright); every
+// current Kimi K2 snapshot draws down real OpenRouter account credits, at
+// roughly $0.0000006/token prompt + $0.0000025/token completion — a
+// fraction of a cent per edit, but real spend, not a free daily quota.
+// NVIDIA is the fallback below, kept around specifically because of the
+// 10-minute hang this same day (see callModel) — a second provider, not
+// just a second attempt at the first one.
 const OPENROUTER_KEY = process.env.OPENROUTER_API_KEY;
 const OPENROUTER_BASE = (process.env.OPENROUTER_BASE || 'https://openrouter.ai/api/v1').replace(/\/$/, '');
-const OPENROUTER_MODEL = process.env.OPENROUTER_LLM_MODEL || 'moonshotai/kimi-k2:free';
+const OPENROUTER_MODEL = process.env.OPENROUTER_LLM_MODEL || 'moonshotai/kimi-k2';
 
 // A hung connection (no error, no response — what actually happened on
 // 2026-08-21: 10 minutes of silence, force-killed by the workflow's own
