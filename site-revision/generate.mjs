@@ -35,13 +35,13 @@ const NVIDIA_KEY = process.env.NVIDIA_API_KEY;
 const NVIDIA_BASE = (process.env.NVIDIA_BASE || 'https://integrate.api.nvidia.com/v1').replace(/\/$/, '');
 const NVIDIA_MODEL = process.env.NVIDIA_LLM_MODEL || 'meta/llama-3.3-70b-instruct';
 
-// Free fallback when NVIDIA errors OR hangs — same OpenRouter idea
-// worker/providers.mjs already uses (priority-5, thin free daily cap,
-// last-resort), just a plain fetch here rather than the full router.
-// Kimi K2's free tier by default: strong instruction-following for a
-// narrow single-element edit like this, and free-tier daily caps matter
-// less here than in the reel worker (one call per feedback item, not
-// thousands a night).
+// Primary model, Rahul's call (2026-08-21) — Kimi K2's free tier via
+// OpenRouter. Strong instruction-following for a narrow single-element
+// edit like this, and free-tier daily caps matter less here than in the
+// reel worker (one call per feedback item, not thousands a night). NVIDIA
+// is the fallback below, kept around specifically because of the 10-minute
+// hang this same day (see callModel) — a second provider, not just a
+// second attempt at the first one.
 const OPENROUTER_KEY = process.env.OPENROUTER_API_KEY;
 const OPENROUTER_BASE = (process.env.OPENROUTER_BASE || 'https://openrouter.ai/api/v1').replace(/\/$/, '');
 const OPENROUTER_MODEL = process.env.OPENROUTER_LLM_MODEL || 'moonshotai/kimi-k2:free';
@@ -113,23 +113,25 @@ async function callCompletions(label, base, key, model, note, originalHtml, extr
   });
 }
 
-// NVIDIA primary, OpenRouter (free Kimi K2 by default) as fallback — only
-// when a key for it is actually set, so this degrades to NVIDIA-only
-// exactly like before if OPENROUTER_API_KEY is never added.
+// OpenRouter (Kimi K2 by default) primary, NVIDIA as fallback — only when
+// a key for it is actually set, so this degrades to OpenRouter-only if
+// NVIDIA_API_KEY is ever removed. Order is Rahul's call, 2026-08-21 — Kimi
+// is the model he wants doing these edits day to day; NVIDIA stays as the
+// safety net given today's hang.
 async function callModel(note, originalHtml) {
-  if (!NVIDIA_KEY && !OPENROUTER_KEY) throw new Error('NVIDIA_API_KEY not set (and no OPENROUTER_API_KEY fallback configured)');
-  if (NVIDIA_KEY) {
+  if (!OPENROUTER_KEY && !NVIDIA_KEY) throw new Error('OPENROUTER_API_KEY not set (and no NVIDIA_API_KEY fallback configured)');
+  if (OPENROUTER_KEY) {
     try {
-      return await callCompletions('NVIDIA', NVIDIA_BASE, NVIDIA_KEY, NVIDIA_MODEL, note, originalHtml);
+      return await callCompletions('OpenRouter', OPENROUTER_BASE, OPENROUTER_KEY, OPENROUTER_MODEL, note, originalHtml, {
+        'HTTP-Referer': process.env.APP_URL || 'https://portal.claritydecoded.com',
+        'X-Title': 'Clarity Site Revision',
+      });
     } catch (e) {
-      if (!OPENROUTER_KEY) throw e;
-      console.log(`[fallback] NVIDIA failed (${e.message}) — trying OpenRouter`);
+      if (!NVIDIA_KEY) throw e;
+      console.log(`[fallback] OpenRouter failed (${e.message}) — trying NVIDIA`);
     }
   }
-  return callCompletions('OpenRouter', OPENROUTER_BASE, OPENROUTER_KEY, OPENROUTER_MODEL, note, originalHtml, {
-    'HTTP-Referer': process.env.APP_URL || 'https://portal.claritydecoded.com',
-    'X-Title': 'Clarity Site Revision',
-  });
+  return callCompletions('NVIDIA', NVIDIA_BASE, NVIDIA_KEY, NVIDIA_MODEL, note, originalHtml);
 }
 
 // The captured selector can go stale if the page changed between the
