@@ -12,7 +12,9 @@
 // compatible /chat/completions) but calls it directly rather than importing
 // worker/router.mjs's full multi-provider machinery — this job makes one
 // call per feedback item, not thousands, so the failover/pacing infra
-// earns its keep there but is unneeded weight here.
+// earns its keep there but is unneeded weight here. It DOES reuse the
+// router's two-provider idea in miniature (NVIDIA primary, OpenRouter
+// fallback) — see callModel below.
 //
 // Usage:
 //   SUPABASE_URL=... SUPABASE_SERVICE_ROLE_KEY=... NVIDIA_API_KEY=... node generate.mjs
@@ -33,6 +35,25 @@ const NVIDIA_KEY = process.env.NVIDIA_API_KEY;
 const NVIDIA_BASE = (process.env.NVIDIA_BASE || 'https://integrate.api.nvidia.com/v1').replace(/\/$/, '');
 const NVIDIA_MODEL = process.env.NVIDIA_LLM_MODEL || 'meta/llama-3.3-70b-instruct';
 
+// Free fallback when NVIDIA errors OR hangs — same OpenRouter idea
+// worker/providers.mjs already uses (priority-5, thin free daily cap,
+// last-resort), just a plain fetch here rather than the full router.
+// Kimi K2's free tier by default: strong instruction-following for a
+// narrow single-element edit like this, and free-tier daily caps matter
+// less here than in the reel worker (one call per feedback item, not
+// thousands a night).
+const OPENROUTER_KEY = process.env.OPENROUTER_API_KEY;
+const OPENROUTER_BASE = (process.env.OPENROUTER_BASE || 'https://openrouter.ai/api/v1').replace(/\/$/, '');
+const OPENROUTER_MODEL = process.env.OPENROUTER_LLM_MODEL || 'moonshotai/kimi-k2:free';
+
+// A hung connection (no error, no response — what actually happened on
+// 2026-08-21: 10 minutes of silence, force-killed by the workflow's own
+// timeout) is worse than an HTTP error: withRetry never even sees it,
+// because nothing ever rejects. AbortController turns "hangs forever" into
+// "throws after N seconds", which withRetry (and then the NVIDIA->OpenRouter
+// fallback below) can actually act on.
+const CALL_TIMEOUT_MS = Number(process.env.MODEL_CALL_TIMEOUT_MS || 60000);
+
 const SYSTEM_PROMPT = `You are editing ONE HTML element on a real website, based on specific user feedback from the site's owner or a client reviewing a draft.
 
 Rules:
@@ -47,34 +68,67 @@ function stripFences(text) {
   return (fenced ? fenced[1] : t).trim();
 }
 
-async function callNvidia(note, originalHtml) {
-  if (!NVIDIA_KEY) throw new Error('NVIDIA_API_KEY not set');
+async function callCompletions(label, base, key, model, note, originalHtml, extraHeaders) {
   return withRetry(async () => {
-    const res = await fetch(`${NVIDIA_BASE}/chat/completions`, {
-      method: 'POST',
-      headers: {
-        Authorization: `Bearer ${NVIDIA_KEY}`,
-        'Content-Type': 'application/json',
-      },
-      body: JSON.stringify({
-        model: NVIDIA_MODEL,
-        temperature: 0.3,
-        max_tokens: 2000,
-        messages: [
-          { role: 'system', content: SYSTEM_PROMPT },
-          { role: 'user', content: `Requested change: ${note}\n\nCurrent HTML:\n${originalHtml}` },
-        ],
-      }),
-    });
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), CALL_TIMEOUT_MS);
+    let res;
+    try {
+      res = await fetch(`${base}/chat/completions`, {
+        method: 'POST',
+        signal: controller.signal,
+        headers: {
+          Authorization: `Bearer ${key}`,
+          'Content-Type': 'application/json',
+          ...extraHeaders,
+        },
+        body: JSON.stringify({
+          model,
+          temperature: 0.3,
+          max_tokens: 2000,
+          messages: [
+            { role: 'system', content: SYSTEM_PROMPT },
+            { role: 'user', content: `Requested change: ${note}\n\nCurrent HTML:\n${originalHtml}` },
+          ],
+        }),
+      });
+    } catch (e) {
+      if (e.name === 'AbortError') {
+        const err = new Error(`${label} timed out after ${CALL_TIMEOUT_MS}ms`);
+        throw err; // no .status — a network-shaped failure, retried/failed-over like any other
+      }
+      throw e;
+    } finally {
+      clearTimeout(timer);
+    }
     if (!res.ok) {
-      const err = new Error(`NVIDIA ${res.status}: ${(await res.text()).slice(0, 300)}`);
+      const err = new Error(`${label} ${res.status}: ${(await res.text()).slice(0, 300)}`);
       err.status = res.status;
       throw err;
     }
     const data = await res.json();
     const content = data?.choices?.[0]?.message?.content;
-    if (!content || !content.trim()) throw new Error('empty response from model');
+    if (!content || !content.trim()) throw new Error(`empty response from ${label}`);
     return stripFences(content);
+  });
+}
+
+// NVIDIA primary, OpenRouter (free Kimi K2 by default) as fallback — only
+// when a key for it is actually set, so this degrades to NVIDIA-only
+// exactly like before if OPENROUTER_API_KEY is never added.
+async function callModel(note, originalHtml) {
+  if (!NVIDIA_KEY && !OPENROUTER_KEY) throw new Error('NVIDIA_API_KEY not set (and no OPENROUTER_API_KEY fallback configured)');
+  if (NVIDIA_KEY) {
+    try {
+      return await callCompletions('NVIDIA', NVIDIA_BASE, NVIDIA_KEY, NVIDIA_MODEL, note, originalHtml);
+    } catch (e) {
+      if (!OPENROUTER_KEY) throw e;
+      console.log(`[fallback] NVIDIA failed (${e.message}) — trying OpenRouter`);
+    }
+  }
+  return callCompletions('OpenRouter', OPENROUTER_BASE, OPENROUTER_KEY, OPENROUTER_MODEL, note, originalHtml, {
+    'HTTP-Referer': process.env.APP_URL || 'https://portal.claritydecoded.com',
+    'X-Title': 'Clarity Site Revision',
   });
 }
 
@@ -125,7 +179,7 @@ async function processOne(item) {
     if (!el) throw new Error('could not locate the original element (selector and text both missed)');
 
     const originalOuterHtml = el.outerHTML;
-    const revised = await callNvidia(item.note, originalOuterHtml);
+    const revised = await callModel(item.note, originalOuterHtml);
     safetyCheck(revised);
 
     el.outerHTML = revised;
@@ -149,7 +203,27 @@ async function processOne(item) {
   }
 }
 
+// A run killed mid-request (the workflow's own timeout-minutes, or a
+// cancelled dispatch) leaves whatever item it was on stuck at
+// status='generating' forever — processOne's own try/catch never gets a
+// chance to write 'error' back, and main()'s query only ever looks at
+// status=eq.new, so a stuck row is invisible to every future run. Safe to
+// reclaim ALL of them unconditionally (not just aged ones) for the same
+// reason reel-process.yml's reclaimStale() can: this workflow's
+// concurrency group has cancel-in-progress:false, so only one run is ever
+// actually working a row at a time — nothing can be "genuinely in
+// progress elsewhere" when this runs at the top of a fresh job.
+async function reclaimStuck() {
+  const stuck = await db.select('site_feedback', `status=eq.generating&select=id`);
+  for (const row of stuck) {
+    await db.patch('site_feedback', `id=eq.${row.id}`, { status: 'new' });
+  }
+  if (stuck.length) console.log(`Reclaimed ${stuck.length} row(s) stuck on 'generating'.`);
+}
+
 async function main() {
+  await reclaimStuck();
+
   const only = process.env.FEEDBACK_ID;
   const query = only
     ? `id=eq.${only}&select=*`
