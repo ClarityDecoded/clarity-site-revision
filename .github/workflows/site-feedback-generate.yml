@@ -1,0 +1,49 @@
+name: Site feedback — generate AI revision
+
+# Turns a site_feedback row (patch_033) into a before/after HTML edit for the
+# owner to review. Fired by the site-feedback-submit Edge Function right
+# after a comment lands (near-instant), with a safety cron as the backstop
+# if GitHub is unreachable or the dispatch secrets aren't set — same
+# resilience shape as reel-process.yml (gotcha #19/#74a): queued either way.
+on:
+  repository_dispatch:
+    types: [site-feedback-new]
+  schedule:
+    # Backstop only. The dispatch above is the real path; this just sweeps up
+    # anything it missed. Every 15 minutes is plenty for feedback volume.
+    - cron: "*/15 * * * *"
+  workflow_dispatch:
+    inputs:
+      feedback_id:
+        description: Process one specific site_feedback id (optional — all pending if blank)
+        required: false
+
+concurrency:
+  group: site-feedback-generate
+  cancel-in-progress: false
+
+env:
+  PUBLIC_LOGS: "1" # public repo = public run logs
+
+jobs:
+  generate:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    defaults:
+      run:
+        working-directory: site-revision
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: npm
+          cache-dependency-path: site-revision/package-lock.json
+      - run: npm install
+      - name: Generate pending revisions
+        env:
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
+          NVIDIA_API_KEY: ${{ secrets.NVIDIA_API_KEY }}
+          FEEDBACK_ID: ${{ github.event.client_payload.id || inputs.feedback_id }}
+        run: node generate.mjs

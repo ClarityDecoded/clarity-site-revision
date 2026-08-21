@@ -1,0 +1,13 @@
+{
+  "name": "clarity-site-revision",
+  "private": true,
+  "version": "0.1.0",
+  "type": "module",
+  "description": "AI-assisted site feedback: turns a markup-tool comment into a targeted before/after HTML edit for the owner to approve. Own folder, own deps, not part of the Vite app (same isolation rule as worker/crawler/runner).",
+  "scripts": {
+    "start": "node generate.mjs"
+  },
+  "dependencies": {
+    "linkedom": "^0.18.13"
+  }
+}
