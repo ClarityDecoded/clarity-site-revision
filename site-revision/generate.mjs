@@ -25,6 +25,7 @@
 import { parseHTML } from 'linkedom';
 import * as db from './supabase.mjs';
 import { installPrivateLogging } from './log-privacy.mjs';
+import { withRetry } from './retry.mjs';
 
 installPrivateLogging();
 
@@ -48,27 +49,33 @@ function stripFences(text) {
 
 async function callNvidia(note, originalHtml) {
   if (!NVIDIA_KEY) throw new Error('NVIDIA_API_KEY not set');
-  const res = await fetch(`${NVIDIA_BASE}/chat/completions`, {
-    method: 'POST',
-    headers: {
-      Authorization: `Bearer ${NVIDIA_KEY}`,
-      'Content-Type': 'application/json',
-    },
-    body: JSON.stringify({
-      model: NVIDIA_MODEL,
-      temperature: 0.3,
-      max_tokens: 2000,
-      messages: [
-        { role: 'system', content: SYSTEM_PROMPT },
-        { role: 'user', content: `Requested change: ${note}\n\nCurrent HTML:\n${originalHtml}` },
-      ],
-    }),
+  return withRetry(async () => {
+    const res = await fetch(`${NVIDIA_BASE}/chat/completions`, {
+      method: 'POST',
+      headers: {
+        Authorization: `Bearer ${NVIDIA_KEY}`,
+        'Content-Type': 'application/json',
+      },
+      body: JSON.stringify({
+        model: NVIDIA_MODEL,
+        temperature: 0.3,
+        max_tokens: 2000,
+        messages: [
+          { role: 'system', content: SYSTEM_PROMPT },
+          { role: 'user', content: `Requested change: ${note}\n\nCurrent HTML:\n${originalHtml}` },
+        ],
+      }),
+    });
+    if (!res.ok) {
+      const err = new Error(`NVIDIA ${res.status}: ${(await res.text()).slice(0, 300)}`);
+      err.status = res.status;
+      throw err;
+    }
+    const data = await res.json();
+    const content = data?.choices?.[0]?.message?.content;
+    if (!content || !content.trim()) throw new Error('empty response from model');
+    return stripFences(content);
   });
-  if (!res.ok) throw new Error(`NVIDIA ${res.status}: ${(await res.text()).slice(0, 300)}`);
-  const data = await res.json();
-  const content = data?.choices?.[0]?.message?.content;
-  if (!content || !content.trim()) throw new Error('empty response from model');
-  return stripFences(content);
 }
 
 // The captured selector can go stale if the page changed between the

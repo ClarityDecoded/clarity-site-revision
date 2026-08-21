@@ -2,6 +2,8 @@
 // worker/*.mjs: plain fetch, service role, no SDK. This job reads/writes
 // two tables and calls one LLM; an npm-installed SDK would be pure overhead.
 
+import { withRetry } from './retry.mjs';
+
 const url = process.env.SUPABASE_URL;
 const key = process.env.SUPABASE_SERVICE_ROLE_KEY;
 
@@ -20,18 +22,22 @@ function headers(extra = {}) {
 
 export async function select(table, query) {
   must();
-  const res = await fetch(`${url}/rest/v1/${table}?${query}`, { headers: headers() });
-  if (!res.ok) throw new Error(`select ${table}: ${res.status} ${await res.text()}`);
-  return res.json();
+  return withRetry(async () => {
+    const res = await fetch(`${url}/rest/v1/${table}?${query}`, { headers: headers() });
+    if (!res.ok) throw new Error(`select ${table}: ${res.status} ${await res.text()}`);
+    return res.json();
+  });
 }
 
 export async function patch(table, query, body) {
   must();
-  const res = await fetch(`${url}/rest/v1/${table}?${query}`, {
-    method: 'PATCH',
-    headers: headers({ Prefer: 'return=representation' }),
-    body: JSON.stringify(body),
+  return withRetry(async () => {
+    const res = await fetch(`${url}/rest/v1/${table}?${query}`, {
+      method: 'PATCH',
+      headers: headers({ Prefer: 'return=representation' }),
+      body: JSON.stringify(body),
+    });
+    if (!res.ok) throw new Error(`patch ${table}: ${res.status} ${await res.text()}`);
+    return res.json();
   });
-  if (!res.ok) throw new Error(`patch ${table}: ${res.status} ${await res.text()}`);
-  return res.json();
 }
